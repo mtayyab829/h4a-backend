@@ -24,14 +24,18 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 // MongoDB connection options optimized for serverless
-const mongooseOptions = {
+// These are MongoDB driver options (not Mongoose-specific)
+const mongoOptions = {
   serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
   socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
-  bufferCommands: false, // Disable mongoose buffering
-  bufferMaxEntries: 0, // Disable mongoose buffering
   maxPoolSize: 1, // Maintain up to 1 socket connection for serverless
   minPoolSize: 1, // Maintain at least 1 socket connection
   maxIdleTimeMS: 30000, // Close connections after 30s of inactivity
+};
+
+// Mongoose-specific options
+const mongooseOptions = {
+  bufferCommands: false, // Disable mongoose buffering (prevents timeout errors)
 };
 
 // Connect to MongoDB with retry logic
@@ -66,7 +70,10 @@ async function connectToMongoDB() {
         }
       }
 
-      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/urlshortener', mongooseOptions);
+      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/urlshortener', {
+        ...mongooseOptions,
+        ...mongoOptions
+      });
       isConnected = true;
       console.log('Connected to MongoDB');
       
