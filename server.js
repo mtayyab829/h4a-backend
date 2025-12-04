@@ -23,10 +23,84 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/urlshortener')
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+// MongoDB connection options optimized for serverless
+const mongooseOptions = {
+  serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+  socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
+  bufferCommands: false, // Disable mongoose buffering
+  bufferMaxEntries: 0, // Disable mongoose buffering
+  maxPoolSize: 1, // Maintain up to 1 socket connection for serverless
+  minPoolSize: 1, // Maintain at least 1 socket connection
+  maxIdleTimeMS: 30000, // Close connections after 30s of inactivity
+};
+
+// Connect to MongoDB with retry logic
+let isConnected = false;
+let connectionPromise = null;
+
+async function connectToMongoDB() {
+  // Check if already connected
+  if (mongoose.connection.readyState === 1) {
+    isConnected = true;
+    return;
+  }
+
+  // If connection is in progress, wait for it
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  // Start new connection
+  connectionPromise = (async () => {
+    try {
+      // If already connecting, wait
+      if (mongoose.connection.readyState === 2) {
+        await new Promise((resolve) => {
+          mongoose.connection.once('connected', resolve);
+          mongoose.connection.once('error', resolve);
+        });
+        if (mongoose.connection.readyState === 1) {
+          isConnected = true;
+          connectionPromise = null;
+          return;
+        }
+      }
+
+      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/urlshortener', mongooseOptions);
+      isConnected = true;
+      console.log('Connected to MongoDB');
+      
+      mongoose.connection.on('error', (err) => {
+        console.error('MongoDB connection error:', err);
+        isConnected = false;
+        connectionPromise = null;
+      });
+      
+      mongoose.connection.on('disconnected', () => {
+        console.log('MongoDB disconnected');
+        isConnected = false;
+        connectionPromise = null;
+      });
+      
+      mongoose.connection.on('reconnected', () => {
+        console.log('MongoDB reconnected');
+        isConnected = true;
+      });
+      
+      connectionPromise = null;
+    } catch (error) {
+      console.error('MongoDB connection error:', error);
+      isConnected = false;
+      connectionPromise = null;
+      throw error;
+    }
+  })();
+
+  return connectionPromise;
+}
+
+// Initialize connection
+connectToMongoDB().catch(err => console.error('Failed to connect to MongoDB:', err));
 
 // Click Event Schema for detailed tracking
 const clickEventSchema = new mongoose.Schema({
@@ -281,8 +355,21 @@ function isImage(mimeType) {
   return mimeType.startsWith('image/');
 }
 
+// Middleware to ensure MongoDB connection
+async function ensureMongoConnection(req, res, next) {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      await connectToMongoDB();
+    }
+    next();
+  } catch (error) {
+    console.error('MongoDB connection failed:', error);
+    return res.status(503).json({ message: 'Database connection failed. Please try again.' });
+  }
+}
+
 // Create a short URL
-app.post('/api/shorten', async (req, res) => {
+app.post('/api/shorten', ensureMongoConnection, async (req, res) => {
   try {
     const { url, slug, expiresIn } = req.body;
 
@@ -661,7 +748,7 @@ async function trackAnalytics(slug, req, clientData = {}) {
 }
 
 // Get URL by slug (no tracking here - tracking is done via POST /api/analytics/:slug)
-app.get('/api/url/:slug', async (req, res) => {
+app.get('/api/url/:slug', ensureMongoConnection, async (req, res) => {
   try {
     const { slug } = req.params;
     
@@ -688,7 +775,7 @@ app.get('/api/url/:slug', async (req, res) => {
 });
 
 // Track comprehensive analytics from client-side
-app.post('/api/analytics/:slug', async (req, res) => {
+app.post('/api/analytics/:slug', ensureMongoConnection, async (req, res) => {
   try {
     const { slug } = req.params;
     const clientData = req.body;
@@ -716,7 +803,7 @@ app.post('/api/analytics/:slug', async (req, res) => {
 });
 
 // Get analytics for a URL
-app.get('/api/analytics/:slug', async (req, res) => {
+app.get('/api/analytics/:slug', ensureMongoConnection, async (req, res) => {
   try {
     const { slug } = req.params;
     const { includeEvents, limit = 100 } = req.query;
@@ -871,7 +958,7 @@ app.post('/api/cleanup', async (req, res) => {
 });
 
 // Get all URLs (admin endpoint)
-app.get('/api/urls', async (req, res) => {
+app.get('/api/urls', ensureMongoConnection, async (req, res) => {
   try {
     const urls = await URL.find({}, { 
       slug: 1, 
@@ -892,7 +979,7 @@ app.get('/api/urls', async (req, res) => {
 // ==================== FILE UPLOAD ENDPOINTS ====================
 
 // Upload a file - stores in MongoDB for fast access
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+app.post('/api/upload', ensureMongoConnection, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'No file uploaded' });
@@ -961,7 +1048,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 });
 
 // Get file info
-app.get('/api/file/:slug', async (req, res) => {
+app.get('/api/file/:slug', ensureMongoConnection, async (req, res) => {
   try {
     const { slug } = req.params;
     
@@ -1053,7 +1140,7 @@ app.get('/api/file/:slug/stats', async (req, res) => {
 });
 
 // Download/view file - serves from MongoDB with caching
-app.get('/api/file/:slug/download', async (req, res) => {
+app.get('/api/file/:slug/download', ensureMongoConnection, async (req, res) => {
   try {
     const { slug } = req.params;
     const { password } = req.query;
@@ -1117,7 +1204,7 @@ app.get('/api/file/:slug/download', async (req, res) => {
 });
 
 // Get all files (for admin/dashboard)
-app.get('/api/files', async (req, res) => {
+app.get('/api/files', ensureMongoConnection, async (req, res) => {
   try {
     const { page = 1, limit = 20, search = '' } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -1187,8 +1274,21 @@ app.delete('/api/file/:slug', async (req, res) => {
 });
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  return res.json({ status: 'ok' });
+app.get('/api/health', async (req, res) => {
+  try {
+    const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    return res.json({ 
+      status: 'ok',
+      mongodb: mongoStatus,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    return res.status(503).json({ 
+      status: 'error',
+      mongodb: 'error',
+      error: error.message 
+    });
+  }
 });
 
 // Start the server (only in non-serverless environment)
