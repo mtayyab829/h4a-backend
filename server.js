@@ -1188,6 +1188,11 @@ app.get('/api/file/:slug/data', ensureMongoConnection, async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     res.setHeader('Last-Modified', file.createdAt.toUTCString());
     
+    // CORS headers for canvas access
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
     if (file.etag) {
       res.setHeader('ETag', `"${file.etag}"`);
     }
