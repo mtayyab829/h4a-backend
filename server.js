@@ -1179,6 +1179,13 @@ app.get('/api/file/:slug/data', ensureMongoConnection, async (req, res) => {
       return res.status(304).end();
     }
 
+    // Set CORS headers explicitly for binary data
+    const origin = req.headers.origin;
+    if (origin && (origin.includes('h4a.us') || origin.includes('localhost'))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+
     // Set caching headers for fast loading
     res.setHeader('Content-Type', file.mimeType);
     res.setHeader('Content-Length', file.size);
