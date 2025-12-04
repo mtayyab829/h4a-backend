@@ -6,24 +6,9 @@ import { nanoid } from 'nanoid';
 import UAParser from 'ua-parser-js';
 import geoip from 'geoip-lite';
 import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
-import mime from 'mime-types';
 import crypto from 'crypto';
 
 dotenv.config();
-
-// Get __dirname equivalent in ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Keep uploads directory for backwards compatibility with existing files
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -125,17 +110,15 @@ const urlSchema = new mongoose.Schema({
 
 const URL = mongoose.model('URL', urlSchema);
 
-// File Schema - supports both DB storage and filesystem storage (for backwards compatibility)
+// File Schema - stores files as binary data in MongoDB
 const fileSchema = new mongoose.Schema({
   slug: { type: String, required: true, unique: true },
   originalName: { type: String, required: true },
-  filename: { type: String, default: null }, // For filesystem storage (legacy)
   mimeType: { type: String, required: true },
   size: { type: Number, required: true },
   type: { type: String, enum: ['image', 'file'], required: true },
-  // Binary data storage in MongoDB (for new uploads)
-  data: { type: Buffer, default: null },
-  storageType: { type: String, enum: ['db', 'filesystem'], default: 'db' },
+  // Binary data storage in MongoDB
+  data: { type: Buffer, required: true },
   // ETag for caching
   etag: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
@@ -946,12 +929,10 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const newFile = new File({
       slug,
       originalName: req.file.originalname,
-      filename: null, // Not using filesystem
       mimeType: req.file.mimetype,
       size: req.file.size,
       type: fileType,
       data: req.file.buffer, // Store binary data directly in MongoDB
-      storageType: 'db',
       etag,
       expiresAt,
       password: password || null,
@@ -1071,7 +1052,7 @@ app.get('/api/file/:slug/stats', async (req, res) => {
   }
 });
 
-// Download/view file - supports both DB and filesystem storage with caching
+// Download/view file - serves from MongoDB with caching
 app.get('/api/file/:slug/download', async (req, res) => {
   try {
     const { slug } = req.params;
@@ -1091,6 +1072,11 @@ app.get('/api/file/:slug/download', async (req, res) => {
     // Check password
     if (file.password && file.password !== password) {
       return res.status(401).json({ message: 'Invalid password' });
+    }
+
+    // Check if file data exists
+    if (!file.data) {
+      return res.status(404).json({ message: 'File data not found' });
     }
 
     // Check ETag for cache validation (304 Not Modified)
@@ -1121,23 +1107,8 @@ app.get('/api/file/:slug/download', async (req, res) => {
       }
     ).catch(err => console.error('Error updating download count:', err));
 
-    // Serve file based on storage type
-    if (file.storageType === 'db' && file.data) {
-      // Serve from MongoDB (fast - data is already in memory)
-      return res.send(file.data);
-    } else if (file.filename) {
-      // Fallback to filesystem for legacy files
-      const filePath = path.join(uploadsDir, file.filename);
-      
-      if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ message: 'File not found on server' });
-      }
-      
-      const fileStream = fs.createReadStream(filePath);
-      fileStream.pipe(res);
-    } else {
-      return res.status(404).json({ message: 'File data not found' });
-    }
+    // Serve file from MongoDB
+    return res.send(file.data);
 
   } catch (error) {
     console.error('Error downloading file:', error);
@@ -1204,142 +1175,13 @@ app.delete('/api/file/:slug', async (req, res) => {
       return res.status(404).json({ message: 'File not found' });
     }
 
-    // Delete file from disk if it's stored on filesystem (legacy files)
-    if (file.storageType === 'filesystem' && file.filename) {
-      const filePath = path.join(uploadsDir, file.filename);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-    }
-
-    // Delete from database (also removes binary data for DB-stored files)
+    // Delete from database (removes binary data)
     await File.deleteOne({ slug });
 
     return res.json({ message: 'File deleted successfully' });
 
   } catch (error) {
     console.error('Error deleting file:', error);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Serve uploaded files statically (for direct image access - legacy support)
-app.use('/uploads', express.static(uploadsDir));
-
-// Migrate a single file from filesystem to database
-app.post('/api/file/:slug/migrate', async (req, res) => {
-  try {
-    const { slug } = req.params;
-    
-    const file = await File.findOne({ slug });
-    
-    if (!file) {
-      return res.status(404).json({ message: 'File not found' });
-    }
-
-    if (file.storageType === 'db') {
-      return res.json({ message: 'File is already stored in database', slug });
-    }
-
-    if (!file.filename) {
-      return res.status(400).json({ message: 'No filesystem filename found' });
-    }
-
-    const filePath = path.join(uploadsDir, file.filename);
-    
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ message: 'File not found on disk' });
-    }
-
-    // Read file from disk
-    const fileBuffer = fs.readFileSync(filePath);
-    const etag = generateETag(fileBuffer);
-
-    // Update document with binary data
-    file.data = fileBuffer;
-    file.storageType = 'db';
-    file.etag = etag;
-    await file.save();
-
-    // Delete file from disk
-    fs.unlinkSync(filePath);
-
-    console.log(`Migrated file to DB: ${slug} (${(file.size / 1024).toFixed(1)} KB)`);
-
-    return res.json({ 
-      message: 'File migrated to database successfully', 
-      slug,
-      size: file.size 
-    });
-
-  } catch (error) {
-    console.error('Error migrating file:', error);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Migrate all filesystem files to database
-app.post('/api/migrate-all-files', async (req, res) => {
-  try {
-    const filesystemFiles = await File.find({ 
-      $or: [
-        { storageType: 'filesystem' },
-        { storageType: { $exists: false } }
-      ],
-      filename: { $ne: null }
-    }).select('-data -analytics');
-
-    const results = {
-      total: filesystemFiles.length,
-      migrated: 0,
-      failed: 0,
-      errors: []
-    };
-
-    for (const file of filesystemFiles) {
-      try {
-        const filePath = path.join(uploadsDir, file.filename);
-        
-        if (!fs.existsSync(filePath)) {
-          results.failed++;
-          results.errors.push({ slug: file.slug, error: 'File not found on disk' });
-          continue;
-        }
-
-        // Read file from disk
-        const fileBuffer = fs.readFileSync(filePath);
-        const etag = generateETag(fileBuffer);
-
-        // Update document with binary data
-        await File.updateOne(
-          { _id: file._id },
-          { 
-            $set: { 
-              data: fileBuffer, 
-              storageType: 'db',
-              etag 
-            } 
-          }
-        );
-
-        // Delete file from disk
-        fs.unlinkSync(filePath);
-
-        results.migrated++;
-        console.log(`Migrated: ${file.slug} (${(file.size / 1024).toFixed(1)} KB)`);
-
-      } catch (err) {
-        results.failed++;
-        results.errors.push({ slug: file.slug, error: err.message });
-      }
-    }
-
-    console.log(`Migration complete: ${results.migrated}/${results.total} files migrated`);
-
-    return res.json(results);
-
-  } catch (error) {
-    console.error('Error migrating files:', error);
     return res.status(500).json({ message: 'Server error' });
   }
 });
