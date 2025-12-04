@@ -1146,7 +1146,97 @@ app.get('/api/file/:slug/stats', async (req, res) => {
   }
 });
 
-// Download/view file - serves from MongoDB with caching
+// Get file data (for frontend download) - no download count increment
+app.get('/api/file/:slug/data', ensureMongoConnection, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { password } = req.query;
+    
+    const file = await File.findOne({ slug });
+    
+    if (!file) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    // Check if file has expired
+    if (file.expiresAt && new Date() > file.expiresAt) {
+      return res.status(410).json({ message: 'This file has expired' });
+    }
+
+    // Check password
+    if (file.password && file.password !== password) {
+      return res.status(401).json({ message: 'Invalid password' });
+    }
+
+    // Check if file data exists
+    if (!file.data) {
+      return res.status(404).json({ message: 'File data not found' });
+    }
+
+    // Check ETag for cache validation (304 Not Modified)
+    const clientETag = req.headers['if-none-match'];
+    if (file.etag && clientETag === `"${file.etag}"`) {
+      return res.status(304).end();
+    }
+
+    // Set caching headers for fast loading
+    res.setHeader('Content-Type', file.mimeType);
+    res.setHeader('Content-Length', file.size);
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(file.originalName)}"`);
+    
+    // Cache for 1 year (immutable content)
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Last-Modified', file.createdAt.toUTCString());
+    
+    if (file.etag) {
+      res.setHeader('ETag', `"${file.etag}"`);
+    }
+
+    // Serve file from MongoDB (no download count increment here)
+    return res.send(file.data);
+
+  } catch (error) {
+    console.error('Error getting file data:', error);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Increment download count (called by frontend after successful download)
+app.post('/api/file/:slug/increment-download', ensureMongoConnection, async (req, res) => {
+  try {
+    const { slug } = req.params;
+    
+    const file = await File.findOne({ slug });
+    
+    if (!file) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    // Check if file has expired
+    if (file.expiresAt && new Date() > file.expiresAt) {
+      return res.status(410).json({ message: 'This file has expired' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Increment download count and update analytics
+    await File.updateOne(
+      { slug },
+      { 
+        $inc: { downloads: 1 },
+        $set: { [`analytics.downloadsByDate.${today}`]: (file.analytics?.downloadsByDate?.[today] || 0) + 1 }
+      }
+    );
+
+    return res.json({ success: true, downloads: file.downloads + 1 });
+
+  } catch (error) {
+    console.error('Error incrementing download count:', error);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Download/view file - serves from MongoDB with caching (kept for backward compatibility)
 app.get('/api/file/:slug/download', ensureMongoConnection, async (req, res) => {
   try {
     const { slug } = req.params;
